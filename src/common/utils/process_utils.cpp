@@ -36,12 +36,13 @@ extern "C" {
 
 #include "common/utils/expected.h"
 #include "common/utils/interpolation.h"
+#include "common/utils/process_internal.h"
 
 namespace vinput::process {
 
-namespace {
+namespace detail {
 
-bool SetNonBlocking(int fd) {
+bool MakeNonBlocking(int fd) {
   const int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) {
     return false;
@@ -75,64 +76,12 @@ std::map<std::string, std::string> BuildEnvMap(const CommandSpec& spec) {
   return env_map;
 }
 
-struct DrainOutcome {
-  std::size_t bytes_read = 0;
-  bool closed = false;
-};
+} // namespace detail
 
-// Events that mean a read is worth attempting on a channel: data, a closed peer, a broken pipe, or
-// a descriptor that died while the pump was running. POLLNVAL has to be here because it is the only
-// way an invalid descriptor gets closed: the read that follows fails with EBADF and reports the
-// channel closed. Without it the channel stays open and poll() returns at once on every iteration,
-// burning the CPU until the deadline.
-constexpr short kReadableChannelEvents = POLLIN | POLLHUP | POLLERR | POLLNVAL;
-
-// Events that end the input channel without a successful write, including an invalid descriptor.
-constexpr short kInputFailureEvents = POLLHUP | POLLERR | POLLNVAL;
-
-// Reads at most `budget` bytes from `fd` and forwards every chunk to `emit`. The budget keeps one
-// fast writer from starving the other channels of the same pump iteration.
-struct DrainFdBudgeted {
-  int fd = -1;
-  std::size_t budget = 0;
-
-  template <typename Emit> DrainOutcome operator()(const Emit& emit) const {
-    DrainOutcome outcome;
-    std::array<char, 4096> buffer{};
-
-    while (outcome.bytes_read < budget) {
-      const std::size_t want = std::min(buffer.size(), budget - outcome.bytes_read);
-      const ssize_t n = ::read(fd, buffer.data(), want);
-      if (n > 0) {
-        const auto count = static_cast<std::size_t>(n);
-        outcome.bytes_read += count;
-        emit(std::string_view(buffer.data(), count));
-        continue;
-      }
-      if (n == 0) {
-        // Peer closed the write end.
-        outcome.closed = true;
-        break;
-      }
-      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-        break;
-      }
-      outcome.closed = true;
-      break;
-    }
-
-    return outcome;
-  }
-};
+namespace {
 
 constexpr int kPollSliceMs = 50;
 constexpr auto kPostExitGrace = std::chrono::milliseconds(200);
-
-// Every channel gets its own budget. Nothing is shared between stdout and stderr, so a child that
-// floods one stream cannot hold the other back: there is no quota to split, no ordering rule and no
-// starvation to compensate for. Starvation would not just be slow - once the starved pipe fills,
-// the child blocks in write() and both directions stall until the deadline.
-constexpr std::size_t kReadBudgetBytes = std::size_t{64} * 1024;
 
 struct PumpOutcome {
   bool timed_out = false;
@@ -161,7 +110,7 @@ PumpOutcome PumpProcess(subprocess::Popen& proc, std::span<const std::byte> inpu
 
   // poll() only announces readiness, so nothing below may block. A descriptor that refuses to
   // switch is left out of the poll set instead of being read while it can still block.
-  const auto make_non_blocking = [](int fd) { return fd < 0 || SetNonBlocking(fd); };
+  const auto make_non_blocking = [](int fd) { return fd < 0 || detail::MakeNonBlocking(fd); };
   const bool in_usable = make_non_blocking(in_fd);
   const bool out_usable = make_non_blocking(out_fd);
   const bool err_usable = make_non_blocking(err_fd);
@@ -280,22 +229,26 @@ PumpOutcome PumpProcess(subprocess::Popen& proc, std::span<const std::byte> inpu
           outcome.input_incomplete = true;
           finish_input();
         }
-      } else if ((revents & kInputFailureEvents) != 0) {
+      } else if ((revents & detail::kInputFailureEvents) != 0) {
         outcome.input_incomplete = true;
         finish_input();
       }
     }
 
     if (out_open && out_idx >= 0 &&
-        (pfds.at(static_cast<std::size_t>(out_idx)).revents & kReadableChannelEvents) != 0) {
-      const DrainOutcome drained = DrainFdBudgeted{.fd = out_fd, .budget = kReadBudgetBytes}(
+        (pfds.at(static_cast<std::size_t>(out_idx)).revents & detail::kReadableChannelEvents) !=
+            0) {
+      const detail::DrainOutcome drained = detail::DrainBudgeted(
+          out_fd, detail::kReadBudgetBytes,
           [&stdout_text](std::string_view chunk) { stdout_text.append(chunk); });
       out_open = !drained.closed;
     }
 
     if (err_open && err_idx >= 0 &&
-        (pfds.at(static_cast<std::size_t>(err_idx)).revents & kReadableChannelEvents) != 0) {
-      const DrainOutcome drained = DrainFdBudgeted{.fd = err_fd, .budget = kReadBudgetBytes}(
+        (pfds.at(static_cast<std::size_t>(err_idx)).revents & detail::kReadableChannelEvents) !=
+            0) {
+      const detail::DrainOutcome drained = detail::DrainBudgeted(
+          err_fd, detail::kReadBudgetBytes,
           [&stderr_text](std::string_view chunk) { stderr_text.append(chunk); });
       err_open = !drained.closed;
     }
@@ -674,8 +627,8 @@ CommandResult Run(const CommandSpec& spec, std::span<const std::byte> stdin_byte
     return result;
   }
 
-  const auto cmd = BuildCmd(spec);
-  const auto env_map = BuildEnvMap(spec);
+  const auto cmd = detail::BuildCmd(spec);
+  const auto env_map = detail::BuildEnvMap(spec);
 
   try {
     auto proc =
@@ -721,8 +674,8 @@ Expected<SpawnedProcess> SpawnForMonitoring(const CommandSpec& spec,
     return UnexpectedError("Command is empty.");
   }
 
-  const auto cmd = BuildCmd(spec);
-  const auto env_map = BuildEnvMap(spec);
+  const auto cmd = detail::BuildCmd(spec);
+  const auto env_map = detail::BuildEnvMap(spec);
 
   try {
     auto proc = subprocess::Popen(
