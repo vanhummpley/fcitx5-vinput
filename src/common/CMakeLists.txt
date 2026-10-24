@@ -22,6 +22,7 @@ set(VINPUT_CONFIG_SOURCES
     utils/interpolation.cpp
     utils/version_utils.cpp
     utils/process_utils.cpp
+    utils/process_session.cpp
 )
 
 add_library(config STATIC
@@ -73,6 +74,7 @@ target_link_libraries(config PUBLIC
     mio::mio
     glaze::glaze
     tl::expected
+    readerwriterqueue::readerwriterqueue
 )
 
 target_link_libraries(common PUBLIC
