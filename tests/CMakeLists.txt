@@ -120,6 +120,21 @@ target_link_libraries(test_process_utils PRIVATE
 
 add_test(NAME test_process_utils COMMAND test_process_utils)
 
+add_executable(test_process_session
+    test_process_session.cpp
+)
+
+target_include_directories(test_process_session PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_process_session PRIVATE
+    common
+    pthread
+)
+
+add_test(NAME test_process_session COMMAND test_process_session)
+
 add_executable(test_editor_utils
     test_editor_utils.cpp
     ${CMAKE_SOURCE_DIR}/src/cli/utils/editor_utils.cpp
